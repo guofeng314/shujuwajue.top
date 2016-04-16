@@ -1,0 +1,84 @@
+#include <math.h>
+#include <string>
+#include <vector>
+#include <iostream>
+#include <fstream>
+#include <algorithm>
+#include <map>
+#include <set>
+#include <tr1/functional>
+#include <unistd.h>
+#include <sys/stat.h>
+#include <tr1/unordered_map>
+#include <sys/socket.h> 
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <string.h>
+#include <stdio.h>
+#include <fcntl.h>
+
+#include <string>
+#include "hiredis.h"
+#include "GFRedis.h"
+
+using namespace std;
+
+
+int main()
+{
+	GFRedis redis("10.119.135.63", 15229);
+ 	vector<string> ks;
+	ks.push_back("name");
+	ks.push_back("name2");	
+	string v = redis.Get("name");	
+	cout<<v<<endl;
+	vector<string> v2 = redis.MGet(ks);
+	for(unsigned i = 0; i < v2.size(); i++)
+	{
+		cout<<v2[i]<<endl;
+	}
+	map<string, string> kv;
+	kv["k1"] = "v1";
+	kv["k2"] = "v2";
+	bool r = redis.MSet(kv);
+	cout<<r<<endl;
+	ks.clear();
+	ks.push_back("k1");
+	ks.push_back("k2");
+	v2 = redis.MGet(ks);
+	for(unsigned i = 0; i < v2.size(); i++)
+        {
+                cout<<v2[i]<<endl;
+        }
+	map<string, string> rv;
+	rv["r1"] = "n1";
+  rv["r2"] = "n2";
+  rv["r3"] = "n3";
+	string u = "u1";
+	set<string> recset;
+	int recnum = redis.dupReptids(rv, u, 2, recset);
+	set<string>::iterator set_it;
+	cout<<"rec num "<<recnum<<"rec size:" <<recset.size()<<endl;
+	for(set_it = recset.begin(); set_it != recset.end(); set_it++)
+	{
+		//cout<<"1"<<endl;
+		string elem = *set_it;
+		cout<<(elem)<<":"<<recnum<<endl;
+	}
+	cout<<"end!"<<endl;
+	redis.HMSet("HMSet_key", rv);
+	map<string, string> hgetall = redis.HGetAll("HMSet_key");
+	map<string, string>::iterator hgetall_it;
+	for(hgetall_it = hgetall.begin(); hgetall_it != hgetall.end(); hgetall_it++)
+	{
+		cout<<(hgetall_it->first + " " + hgetall_it->second)<<endl;
+	}
+	redis.LPush("l_key", "a");
+	redis.LPush("l_key", "a");
+	redis.LPush("l_key", "a");
+	vector<string> v3 = redis.LRange("l_key");
+	for(unsigned i = 0; i < v3.size(); i++)
+  {
+    cout<<v3[i]<<endl;
+  }
+}

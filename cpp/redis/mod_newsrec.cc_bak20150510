@@ -1,0 +1,1626 @@
+#include <math.h>
+#include <string>
+#include <vector>
+#include <iostream>
+#include <fstream>
+#include <algorithm>
+#include <map>
+#include <tr1/functional>
+#include <unistd.h>
+#include <sys/stat.h>
+#include <tr1/unordered_map>
+#include <sys/socket.h> 
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <string.h>
+#include <stdio.h>
+#include <fcntl.h>
+
+
+#include "logging.h"
+#include "module.h"
+#include "downstream/memcached/server.h"
+#include "downstream/memcached/request.h"
+#include "downstream/memcached/response.h"
+#include "downstream/http/server.h"
+#include "downstream/http/request.h"
+#include "downstream/http/response.h"
+#include "boost/shared_ptr.hpp"
+#include "hiredis/hiredis.h"
+#include "json/json.h"
+#include <stdlib.h>
+#include <sys/time.h>
+
+
+
+LOGGING_INIT("mod_newsrec");
+
+using namespace cloud_ucs;
+using namespace std::tr1::placeholders;
+using namespace std;
+
+enum ISP 
+{
+    IP_QUERY_ISP_UNKNOWN = 0, 
+    IP_QUERY_ISP_TELECOM,     // 电信
+    IP_QUERY_ISP_CNC,         // 网通
+    IP_QUERY_ISP_CMNET,       // 移动
+    IP_QUERY_ISP_TIETONG,     // 铁通
+    IP_QUERY_ISP_CERNET,      // 教育网
+    IP_QUERY_ISP_DXT,         // 电信通
+    IP_QUERY_ISP_CHX,         // 广东互通长鸿
+    IP_QUERY_ISP_XIAOISP      // 小ISP
+};
+
+
+struct IpDataItemInfo 
+{
+    uint32_t startIp;
+    uint32_t endIp;
+    
+    char area1[256];
+    char area2[256];
+    ISP isp;
+    ISP speed;
+    
+    char zip[7];
+    char area[5];
+    //char city[256];
+};
+struct IpIndexItemInfo 
+{
+	uint32_t startIp;
+	uint32_t endIp;
+	uint32_t area1;
+	uint32_t area2;
+	uint32_t code;
+	uint32_t zip;
+};
+
+typedef std::vector<IpDataItemInfo>::const_iterator const_iterator;
+
+
+struct K_V
+{
+	string k;
+	int v;	
+};
+
+
+vector<K_V> RandSel2(vector<K_V> data, unsigned int sel)
+{
+	float sum = 0;
+	vector<K_V> result;
+	unsigned int *res = new unsigned int[sel]; 
+	double *sum_selected = new double[sel];
+	sum = 0;
+	double sum_sel = 0;
+	for(unsigned int i = 0; i < sel; i++)
+	{
+		sum += data[i].v;
+		res[i] = i;
+	}
+	
+	for(unsigned int i = sel; i < data.size(); i++)
+	{
+		sum_sel = 0;
+		for(unsigned int j = 0; j < sel; j++)
+		{
+			if(j == 0)
+			{
+				sum_selected[j] = 1.0f / data[res[j]].v;
+			}
+			else
+			{
+				sum_selected[j] = sum_selected[j - 1] +  1.0f / data[res[j]].v;;
+			}
+			sum_sel += data[res[j]].v;
+		}
+
+		sum = sum + data[i].v;
+		double r = (0.001 + rand() % 10000) /10000.0;
+        //LOG(INFO)<<"rand1: "<<r<<"\n";
+		double p = 1;
+		double child = 0;
+		double mother = 0;
+		for(unsigned int j  = 0; j < sel; j++)
+		{
+			if(j == 0)
+			{
+				child = sum_sel;
+				mother = sum;
+				p = p * child / mother;
+			}
+			else
+			{
+				child = child - data[res[j - 1]].v;
+				mother = mother - data[res[j - 1]].v;
+				p = p * child / mother;
+			}
+		}
+		p = 1 - p;
+		if( r < p)
+		{
+			double r2 = sum_selected[ sel - 1 ] * (0.001 + rand() % 10000)/10000.0;
+            //LOG(INFO)<<"rand2: "<<r2 << "sum-sel[2]"<<  sum_selected[ sel - 1 ] <<"\n";
+			for(unsigned int j = 0; j < sel; j++)
+			{
+				if (r2 < sum_selected[j])
+				{
+					res[j] = i;
+					break;
+				}
+			}
+		}
+	}
+	for(unsigned int i = 0; i < sel; i++)
+	{
+		result.push_back(data[res[i]]);
+        LOG(INFO)<<"sel res"<<data[res[i]].k<<"\n";
+	}
+    delete []res;
+    delete []sum_selected;
+	return result;
+}
+
+
+
+vector<K_V> RandSel(vector<K_V> data, unsigned int sel)
+{
+	float sum = 0;
+	vector<K_V> result;
+	if(data.size() < sel)
+    	{
+        	return result;
+    	}
+	unsigned int *res = new unsigned int[sel]; 
+	sum = 0;
+	for(unsigned int i = 0; i < sel; i++)
+	{
+		sum += data[i].v;
+		res[i] = i;
+	}
+	
+	for(unsigned int i = sel; i < data.size(); i++)
+	{
+        unsigned int r = rand() % (i + 1);
+        if(r < sel)
+        {
+            res[r] = i;
+        }
+	}
+	for(unsigned int i = 0; i < sel; i++)
+	{
+		result.push_back(data[res[i]]);
+        LOG(INFO)<<"sel res"<<data[res[i]].k<<"\n";
+	}
+    delete []res;
+	return result;
+}
+
+
+
+unsigned char fromHex(const unsigned char &x)  
+{  
+	return isdigit(x) ? x-'0' : x-'A'+10;  
+}  
+std::string URLDecode(const std::string &sIn)  
+{  
+	std::string sOut;  
+	for( size_t ix = 0; ix < sIn.size(); ix++ )  
+	{  
+		unsigned char ch = 0;  
+		if(sIn[ix]=='%')  
+		{  
+			ch = (fromHex(sIn[ix+1])<<4);  
+			ch |= fromHex(sIn[ix+2]);  
+			ix += 2;  
+		}  
+		else if(sIn[ix] == '+')  
+		{  
+			ch = ' ';  
+		}  
+		else  
+		{  
+			ch = sIn[ix];  
+		}  
+		sOut += (char)ch;  
+	}  
+	return sOut;  
+}
+std::vector<std::string> split_msp(const std::string &line, std::string sps)
+{
+        std::vector<std::string> vec;
+        std::set<char> chs;
+        unsigned int size = sps.size();
+        for(unsigned int i = 0; i < size; i++)
+        {
+            chs.insert(sps[i]);
+        }
+        size = line.size(); 
+        int begin = 0;
+        int pos = 0;
+        for(unsigned int i = 0; i < size; i++)
+        {
+            char ch = line[i];
+            if(chs.find(ch) != chs.end())
+            {
+                pos = i;
+                if(pos == begin)
+                {
+                    vec.push_back("");
+                }
+                else
+                {
+                    vec.push_back(line.substr(begin,pos - begin));
+                }
+                begin = pos + 1;
+            }
+
+        }
+        vec.push_back(line.substr(begin, line.size() -begin));
+        return vec;
+}
+std::string strim(const std::string & line_in)
+{
+	    unsigned int begin = 0;
+	    unsigned int end = line_in.size() - 1;
+	    unsigned int i = 0;
+	    for(i = begin; i >= 0 && i < line_in.size() && (ispunct(line_in[i]) == true); i++)
+	    {
+	        begin++;
+	    }
+	                        
+	    for(i = end; i >= 0 && i < line_in.size() && (ispunct(line_in[i]) == true); i--)
+	    {
+	        end--;
+	    }
+	    if(end <= begin)
+	    {
+	        return "";
+	    }
+	    else
+	    {
+	        return line_in.substr(begin, end - begin + 1);
+	    }
+}
+std::string mytrim(const std::string & line_in)
+{
+    unsigned int begin = 0;
+    unsigned int end = line_in.size() - 1;
+    unsigned int i = 0;
+    for(i = begin; i >= 0 && i < line_in.size() && (line_in[i] == ' ' || line_in[i] == '\t' || line_in[i] == '\r' || line_in[i] == '\n'); i++)
+    {
+        begin++;
+    }
+                        
+    for(i = end; i >= 0 && i < line_in.size() && (line_in[i] == ' ' || line_in[i] == '\t' || line_in[i] == '\r' || line_in[i] == '\n'); i--)
+    {
+        end--;
+    }
+    if(end <= begin)
+    {
+        return "";
+    }
+    else
+    {
+        return line_in.substr(begin, end - begin + 1);
+    }
+}
+
+
+std::vector<std::string> split(const std::string & line_in, std::string dem)
+{
+        std::vector<std::string> vec;
+        size_t pos;
+        size_t begin = 0;
+        while((pos = line_in.find(dem, begin)) != std::string::npos )
+        {
+            if(pos != begin)
+            {
+                 vec.push_back(line_in.substr(begin, pos - begin));
+            }
+            begin = pos + 1;
+        }
+        vec.push_back(line_in.substr(begin, line_in.size() - begin));
+        return vec;
+}
+
+	
+std::map<std::string,std::string> LoadMap(std::string file, std::string seg)
+{
+	    std::map<std::string,std::string> dataset;
+	    ifstream inFile;
+	    std::string in_line;
+	    inFile.open(file.c_str(), ios::in);
+	    while(getline(inFile, in_line))
+	    {
+	        //dataset.insert(in_line);
+	        std::vector<std::string> ss = split(in_line,seg);
+	        if(ss.size() == 2)
+	        {
+	            dataset.insert(make_pair(ss[0],ss[1]));
+	        }
+	    }
+	    inFile.close();
+	    return dataset;
+}
+
+struct NEWS_WEIGHT
+{
+    Json::Value news;
+    float weight;
+};
+void SortTop(NEWS_WEIGHT heap[], int n)
+{
+    NEWS_WEIGHT tmp;
+    int max_p = 0;
+    for(int i = 0; i < n - 1; i++)
+    {
+        max_p = i;
+        for(int j = i+ 1; j < n ; j++)
+        {
+            if(heap[max_p].weight < heap[j].weight)
+            {
+                max_p = j;
+            }
+        }
+        tmp = heap[i];
+        heap[i] = heap[max_p];
+        heap[max_p] = tmp;    
+    }
+}
+void Adjust(NEWS_WEIGHT heap[], int n, NEWS_WEIGHT a)
+{
+    if(heap[0].weight >= a.weight)
+    {
+        return;
+    }
+    int p = 0;
+    int sign = 0;
+    heap[p] = a;
+    while(sign < 2)
+    {
+        if(2 * p + 1 >= n)
+        {
+           break;
+        }
+        if(2 * p + 2 >=n)
+        {
+            int q = 2 * p + 1;
+            if(q >= n || heap[q].weight >= heap[p].weight)
+            {
+                 sign++;
+            }
+            else
+            {
+                NEWS_WEIGHT tmp = heap[q];
+                heap[q] =  heap[p];
+                heap[p] = tmp;
+                p = q;
+                sign = 0;
+            }
+        }
+        else
+        {
+            int min_child = heap[2 * p + 2].weight <=  heap[2 * p + 1].weight ? 2 * p + 2 : 2 * p + 1;
+            int max_child = heap[2 * p + 2].weight >   heap[2 * p + 1].weight ? 2 * p + 2 : 2 * p + 1;
+            int q = min_child;
+            if(q >= n || heap[q].weight >= heap[p].weight)
+            {
+                sign++;
+            }
+            else
+            {
+                NEWS_WEIGHT tmp = heap[q];
+                heap[q] =  heap[p];
+                heap[p] = tmp;
+                p = q;
+                sign = 0;
+            }
+            q = max_child;
+            if(q >= n || heap[q].weight >= heap[p].weight)
+            {
+                sign++;
+            }
+            else
+            {
+                NEWS_WEIGHT tmp = heap[q];
+                heap[q] =  heap[p];
+                heap[p] = tmp;
+                p = q;
+                sign = 0;
+            }
+
+        }
+    }
+}
+
+
+class Mod_NewsRecModule : public cloud_ucs::Module
+{
+    public:
+        Mod_NewsRecModule();
+        ~Mod_NewsRecModule();
+
+        bool Init(const std::string& conf, int *thread_num);
+
+        void Search(const std::map<std::string, std::string>& params, const cloud_ucs::InvokeCompleteHandler& cb);
+        void GetResult(const std::map<std::string, std::string>& params, const cloud_ucs::InvokeCompleteHandler& cb);
+        void Status(const map<string, string>& params, const InvokeCompleteHandler& cb);
+
+        void HandleGetResult(cloud_ucs::downstream::ErrCode ec, 
+                boost::shared_ptr<cloud_ucs::downstream::http::GetResponse> response, 
+                const cloud_ucs::InvokeCompleteHandler& complete_handler, 
+                boost::shared_ptr<cloud_ucs::downstream::http::GetRequest> request);
+
+        void HandleStatus(downstream::ErrCode ec, 
+                boost::shared_ptr<downstream::http::GetResponse> response, 
+                const InvokeCompleteHandler& complete_handler, 
+                boost::shared_ptr<downstream::http::GetRequest> request);
+				void HandleResponse(downstream::ErrCode ec,
+                boost::shared_ptr<downstream::http::GetResponse> response,
+                    const InvokeCompleteHandler& complete_handler,
+                boost::shared_ptr<downstream::http::PostRequest> request);
+    private:
+    cloud_ucs::downstream::http::Server* baidu_server_;
+	boost::shared_ptr<cloud_ucs::downstream::http::Server> sptr_baidu_server_;
+	//DTreeClass<word_index_t> *ptree;
+    string user_host;
+    int user_port;
+    string user_pass;
+    
+    string news_host;
+    int news_port;
+    string news_pass;
+
+    bool need_guid_mid;
+    string guid_mid_host;
+    int guid_mid_port;
+    string guid_mid_pass;
+   
+    unsigned int max_res_num;    //max return news num
+    unsigned int word_num_tocall; //words for call news from redis
+    unsigned int tag_num_tocall; //tags for call news from redis
+    unsigned int kws_num_ret; //kws to return
+
+    redisContext* user_redis_context_;
+    redisContext* news_redis_context_;
+    redisContext* guid_mid_redis_context_;
+    std::map<std::string,std::string> tagmap;
+    struct timeval timeout;
+    uint32_t ipItemCount;
+		std::vector<IpDataItemInfo> ipDataItems;
+		tr1::unordered_map<std::string, std::string> zipcode2city;
+		tr1::unordered_map<std::string, std::string> zipcode2prov;
+		
+		string code2city(string ip_addr);
+		const_iterator ipQuery(const char* ipString);
+		bool code2mapInitial(const char* filename);
+		bool initialize(const char* filename); 
+};
+
+
+Mod_NewsRecModule::Mod_NewsRecModule()
+{
+    user_redis_context_ = NULL;
+    news_redis_context_ = NULL;
+    guid_mid_redis_context_ = NULL;
+}
+
+Mod_NewsRecModule::~Mod_NewsRecModule()
+{
+//    delete baidu_server_;
+    
+/*    if (ptree != NULL) {
+        delete ptree;
+        ptree = NULL;
+    }
+    if (parray != NULL) {
+        free(parray);
+        parray = NULL;
+    }
+*/
+}
+
+bool Mod_NewsRecModule::initialize(const char* filename)
+{
+	/*std::ifstream ifs(filename, std::fstream::in|std::fstream::binary);
+	if (!ifs) {
+		std::cerr << "can't open the " << filename << std::endl;
+		return false;
+	}*/
+    int handle = -1;
+    handle = open(filename, O_RDONLY);
+    if(handle == -1)
+    {
+        return false;
+    }
+
+    ipItemCount = 0;
+    /*char *buffer = new char [sizeof(ipItemCount)];
+	ifs.read(buffer, sizeof(ipItemCount));
+    for(int i = 0; i < sizeof(ipItemCount); i++)
+    {
+        ipItemCount += (uint32_t) buffer[i] + (ipItemCount<<8);
+    }*/
+    read(handle, &ipItemCount, sizeof(ipItemCount));
+    std::cout<<ipItemCount<<endl;
+	
+    IpIndexItemInfo ipIdxItem;
+	IpDataItemInfo ipDatItem;
+	size_t ipIdxItemSize = sizeof(ipIdxItem);
+	uint32_t code = 0;
+	for (size_t i = 0; i < ipItemCount; i++) {
+		if (read(handle, &ipIdxItem , ipIdxItemSize)) 
+		{
+			memset(&ipDatItem, 0, sizeof(ipDatItem));
+			ipDatItem.startIp = ipIdxItem.startIp;
+			ipDatItem.endIp = ipIdxItem.endIp;
+			code = ipIdxItem.code;
+			code = code >> 16;
+			snprintf(ipDatItem.area, 5, code > 0 ? "0%d" : "%d", code);
+			code = ipIdxItem.zip >> 12;
+			snprintf(ipDatItem.zip, 7, code > 0 ? "%06d" : "%d", code);
+			ipDataItems.push_back(ipDatItem);
+		}
+	}
+
+	close(handle);
+
+	return true;
+}
+
+bool Mod_NewsRecModule::code2mapInitial(const char* filename)
+{
+	ifstream readfile;
+	readfile.open(filename,ios::in);
+	if (!readfile)
+	{
+		//cout<<"read file failed!"<<filename<<endl;
+		return false;
+	}
+	while(readfile)
+	{
+		string line;
+		getline(readfile,line);
+		if (line.length() > 0)
+		{
+			line=mytrim(line);
+			vector<string> tempvec = split(line,"\t");
+			if (tempvec.size() != 3)
+				continue;
+			tempvec[0] = mytrim(tempvec[0]);
+			tempvec[1] = mytrim(tempvec[1]);
+			tempvec[2] = mytrim(tempvec[2]);
+			//cout<<tempvec[0]<<"\t"<<tempvec[2]<<endl;
+			if (zipcode2city.find(tempvec[1]) == zipcode2city.end())
+				zipcode2city.insert(tr1::unordered_map<string,string>::value_type(tempvec[2], tempvec[0]));
+			if (zipcode2prov.find(tempvec[2]) == zipcode2prov.end())
+				zipcode2prov.insert(tr1::unordered_map<string,string>::value_type(tempvec[2], tempvec[1]));
+		}
+	}
+	readfile.close();
+	return true;
+}
+
+
+const_iterator Mod_NewsRecModule::ipQuery(const char* ipString)
+{
+	const_iterator begin = ipDataItems.begin();
+	const_iterator mid   = ipDataItems.end();
+	const_iterator end   = ipDataItems.end();
+
+	// FIXME for multithreading
+	struct in_addr addr;
+	if (inet_aton(ipString, &addr) == 0) { 
+		return end;
+	}
+
+	uint32_t ip = ntohl(addr.s_addr);
+	while (begin < end) {
+		mid = (end - begin) / 2 + begin;
+		if (mid->startIp <= ip && mid->endIp >= ip) return mid;
+		if (mid->startIp > ip ) {
+			end = mid;
+		} 
+		else {
+			begin = mid;
+		}
+	}
+	//tr1::unordered_map<string,string>::const_iterator city_citer = zipcode2city.find(string(ipDataItems->zip));
+	return ipDataItems.end();
+}
+
+
+string Mod_NewsRecModule::code2city(string ip_addr)
+{
+	const_iterator ipItemInfo = ipQuery(ip_addr.c_str());
+	//cout<<"city code:\t"<<ipItemInfo->zip<<endl;
+	//cout<<zipcode2city.size()<<"\t"<<zipcode2prov.size()<<endl;
+	string zipcode(ipItemInfo->zip);
+	zipcode = mytrim(zipcode);
+	string local_info;
+	tr1::unordered_map<string,string>::const_iterator city_citer = zipcode2city.find(zipcode);
+	if (city_citer != zipcode2city.end())
+	{
+		local_info = city_citer->second;
+	}
+	tr1::unordered_map<string,string>::const_iterator prov_citer = zipcode2prov.find(zipcode);
+	if (prov_citer != zipcode2prov.end())
+	{
+		local_info = local_info + "\t" + prov_citer->second;
+	}
+	return local_info;
+}
+
+bool Mod_NewsRecModule::Init(const std::string& conf, int* thread_num)
+{
+    *thread_num = 1;
+    
+    ///
+    LOG(INFO)<<"load config from "<<conf<<"\n";
+    ifstream in_file(conf.c_str());
+    string in_line;
+    map<string, string> map_config;
+    while(getline(in_file, in_line))
+    {
+        if(in_line[0] != '#')
+        {
+          vector<string> vec_pair = split(in_line, "=");
+          if(vec_pair.size() == 2)
+          {
+             map_config.insert(make_pair(vec_pair[0], vec_pair[1]));
+          }
+        }
+    }
+    in_file.close();
+    LOG(DEBUG) << "TESTModule::Init conf: end " << conf;
+    Register("GetRecNews", std::tr1::bind(&Mod_NewsRecModule::Search, this, _1, _2));
+    Register("GetResult", std::tr1::bind(&Mod_NewsRecModule::GetResult, this, _1, _2));
+    Register("Status", std::tr1::bind(&Mod_NewsRecModule::Status, this, _1, _2));
+
+    //baidu_server_ = new cloud_ucs::downstream::http::Server(this, "www.baidu.com", 80, 1000);
+    //#if 0
+    //baidu_server_ = new cloud_ucs::downstream::http::Server(this, "127.0.0.1", 8370, 200, 5000);
+    //baidu_server_->SetServerStrategy(10, 10, 0, 0); 
+    //#else
+    //baidu_server_ = new cloud_ucs::downstream::http::Server(this, 8360, 2000, 50000);
+    
+    //sptr_baidu_server_->AddSlaveServer(slave_hosts);
+    //sptr_baidu_server_->SetServerStrategy(3, 10, 2, 0); 
+    
+    //sptr_baidu_server_->SetServerStrategy(10, 1000, 4, 100*1000); 
+    //sptr_baidu_server_->SetServerStrategy(3, 100, 2, 60*1000); 
+    //#endif
+   map<string, string>::iterator it;
+   it = map_config.find("user_host");
+   if(it == map_config.end())
+   {
+       LOG(ERROR) << "Failed init user redis host \n";
+        return false;
+   }
+   else
+   {
+      user_host = it->second;
+   }
+
+   it = map_config.find("user_port");
+   if(it == map_config.end())
+   {
+       LOG(ERROR) << "Failed init user redis port \n";
+        return false;
+   }
+   else
+   {
+      user_port = atoi((it->second).c_str());
+   }
+   user_pass = "";
+   it = map_config.find("user_pass");
+   if(it == map_config.end())
+   {
+     LOG(INFO)<<"user redis no pass \n";
+   }
+   else
+   {
+      user_pass = it->second;
+   }
+
+
+
+   it = map_config.find("news_host");
+   if(it == map_config.end())
+   {
+       LOG(ERROR) << "Failed init news redis host \n";
+        return false;
+   }
+   else
+   {
+      news_host = it->second;
+   }
+   it = map_config.find("news_port");
+   if(it == map_config.end())
+   {
+       LOG(ERROR) << "Failed init news redis port \n";
+        return false;
+   }
+   else
+   {
+      news_port = atoi((it->second).c_str());
+   }
+   news_pass = "";
+   it = map_config.find("news_pass");
+   if(it == map_config.end())
+   {
+       LOG(INFO) << "news redis no pass \n";
+       //return false;
+   }
+   else
+   {
+       news_pass = it->second;
+   }
+
+   need_guid_mid =false;
+   it = map_config.find("need_guid_mid");
+   if(it != map_config.end())
+   {
+			need_guid_mid = it->second == "true" ? true : false;	      
+   }
+   if(need_guid_mid == true)
+   {
+	   	 guid_mid_host = "";
+		   it = map_config.find("guid_mid_host");
+		   if(it == map_config.end())
+		   {
+		       LOG(ERROR) << "Failed init guid_mid redis host \n";
+		       return false;
+		   }
+		   else
+		   {
+		      guid_mid_host = it->second;
+		   }
+		   
+		   
+		  
+		   guid_mid_port = 0;
+		   it = map_config.find("guid_mid_port");
+		   if(it == map_config.end())
+		   {
+		       LOG(ERROR) << "Failed init guid_mid redis port \n";
+		       return false;
+		   }
+		   else
+		   {
+		      guid_mid_port = atoi((it->second).c_str());
+		   }
+           guid_mid_pass = "";
+           it = map_config.find("guid_mid_pass");
+           if(it == map_config.end())
+           {
+               LOG(INFO) << "Failed init guid_mid redis host \n";
+           }
+           else
+           {
+               guid_mid_pass = it->second;
+           }
+   }
+   
+   
+   string id_tag_file = "../conf/id_tag.map";
+   it = map_config.find("id_tag");
+   if(it == map_config.end())
+   {
+       LOG(ERROR) << "Failed init user redis host \n";
+       return false;
+   }
+   else
+   {
+      id_tag_file = it->second;
+   }
+   tagmap = LoadMap(id_tag_file,"\t");
+   if(tagmap.size() < 1)
+   {
+   		LOG(ERROR) << "TESTModule::load id_tag end: ";
+   		return false;
+   }
+	 string ipInfoDataFile = "../conf/ip_locate_data.bin";
+	 it = map_config.find("ip_locate_data");
+   if(it == map_config.end())
+   {
+       LOG(ERROR) << "Failed init ipInfoDataFile \n";
+       return false;
+   }
+   else
+   {
+      ipInfoDataFile = it->second;
+   }
+	 
+	 string code2cityFile = "../conf/code2city.lst";
+	 it = map_config.find("code2city");
+	 if(it == map_config.end())
+   {
+       LOG(ERROR) << "Failed init code2cityFile  \n";
+        return false;
+   }
+   else
+   {
+      code2cityFile = it->second;
+   }
+   
+	 bool succ = initialize(ipInfoDataFile.c_str());	
+	 if(succ == false)
+	 {
+	 		LOG(ERROR) << "Failed init ipInfoData  \n";
+	 		return false;
+	 }
+	 
+	 succ = code2mapInitial(code2cityFile.c_str());	
+   if(succ == false)
+	 {
+	 		LOG(ERROR) << "Failed init code2city \n";
+	 		return false;
+	 }
+	 
+   struct timeval timeouttmp = {0, 500000};
+   timeout = timeouttmp;
+   user_redis_context_ = redisConnectWithTimeout(user_host.c_str(), user_port, timeout);
+   if(user_redis_context_ == NULL || user_redis_context_->err)
+   {
+   			LOG(INFO) << "Init user_redis_context_ failed" << "\n" ;
+            redisFree(user_redis_context_);
+   			return false;
+   }
+   if(user_pass.size() > 2)
+   {
+       redisReply *reply;
+       reply= (redisReply*)redisCommand(user_redis_context_, "AUTH %s", user_pass.c_str());
+       if (reply->type == REDIS_REPLY_ERROR)
+       {
+           LOG(INFO) << "Init user_redis_context_ failed" << "\n" ;
+           freeReplyObject(reply);
+           return false;
+       }
+   }
+
+   news_redis_context_ = redisConnectWithTimeout(news_host.c_str(), news_port, timeout);
+   if(news_redis_context_ == NULL || news_redis_context_->err)
+   {
+   			LOG(INFO) << "Init news_redis_context_ failed" << "\n" ;
+            redisFree(news_redis_context_);
+   			return false;
+   }
+
+   if(news_pass.size() > 2)
+   {
+       redisReply *reply;
+       reply= (redisReply*)redisCommand(news_redis_context_, "AUTH %s", news_pass.c_str());
+       if (reply->type == REDIS_REPLY_ERROR)
+       {
+           LOG(INFO) << "Init user_redis_context_ failed" << "\n" ;
+           freeReplyObject(reply);
+           return false;
+       }
+   }
+
+
+   if(need_guid_mid == true)
+   {   
+	   guid_mid_redis_context_ = redisConnectWithTimeout(guid_mid_host.c_str(), guid_mid_port, timeout);  
+	   if(guid_mid_redis_context_ == NULL || guid_mid_redis_context_->err)
+	   {
+	   			LOG(INFO) << "Init guid_mid_redis_context_ failed" << "\n" ;
+                redisFree(guid_mid_redis_context_);
+	   			return false;
+	   }
+       if(guid_mid_pass.size() > 2)
+       {
+          redisReply *reply;
+          reply= (redisReply*)redisCommand(guid_mid_redis_context_, "AUTH %s", guid_mid_pass.c_str());
+          if (reply->type == REDIS_REPLY_ERROR)
+          {
+               LOG(INFO) << "Init user_redis_context_ failed" << "\n" ;
+               freeReplyObject(reply);
+               return false;
+          }
+       }
+   }
+
+   max_res_num = 10;
+   it = map_config.find("max_res_num");
+   if(it != map_config.end())
+   {
+      max_res_num = atoi(it->second.c_str());
+   }
+   if(max_res_num < 5)
+   {
+      max_res_num = 10;
+   }
+   LOG(INFO) << "max_res_num"<< max_res_num << "\n" ;
+   
+   word_num_tocall = 3;
+   it = map_config.find("word_num_tocall");
+   if(it != map_config.end())
+   {
+      word_num_tocall = atoi(it->second.c_str());
+   }
+   if(word_num_tocall < 1)
+   {
+      word_num_tocall = 0;
+   }
+   LOG(INFO) << "word_num_tocall"<< word_num_tocall << "\n" ;
+
+   tag_num_tocall = 3;
+   it = map_config.find("tag_num_tocall");
+   if(it != map_config.end())
+   {
+      tag_num_tocall = atoi(it->second.c_str());
+   }
+   if(tag_num_tocall < 1)
+   {
+      tag_num_tocall = 0;
+   }
+   LOG(INFO) << "tag_num_tocall"<< tag_num_tocall << "\n" ;
+   
+   kws_num_ret = 3;
+   it = map_config.find("kws_num_ret");
+   if(it != map_config.end())
+   {
+      kws_num_ret = atoi(it->second.c_str());
+   }
+   if(kws_num_ret < 1)
+   {
+      kws_num_ret = 0;
+   }
+   LOG(INFO) << "tag_num_tocall"<< tag_num_tocall << "\n" ;
+
+   LOG(INFO) << "Init succeed" << "\n" ;
+   return true;
+}
+
+void Mod_NewsRecModule::Search(const std::map<std::string, std::string>& params, const cloud_ucs::InvokeCompleteHandler& cb)
+{
+    LOG(INFO) <<"news_rec begin"<<"\n";
+    std::map<std::string, std::string> res;
+	cloud_ucs::InvokeResult result;
+     
+    struct timeval t_start,t_end;
+    gettimeofday(&t_start, NULL);
+    
+    double cost_time;
+    srand(time(NULL));
+    string mid = "";
+    std::map<std::string, std::string>::const_iterator iter = params.find("mid");
+	if ((iter == params.end()))
+	{
+        res["result"] = string("{\"result\":[]}");
+		result.__set_results(res);
+		cb(result);
+		return;
+	}
+	else
+	{
+	    mid = URLDecode(iter->second);	
+	}
+			
+	string guid = "";
+	iter = params.find("guid");
+	if ((iter != params.end()))
+	{
+		guid = URLDecode(iter->second);	  
+	}
+					
+	string enhanceDomain = "";
+	iter = params.find("apid");
+	if ((iter != params.end()))
+	{
+		 enhanceDomain = URLDecode(iter->second);
+	}
+			
+	string ip = "";
+	iter = params.find("ip");
+	if ((iter != params.end()))
+	{
+	      ip = URLDecode(iter->second);
+	}
+	  
+	LOG(INFO) <<"begin redis read"<<"\n";
+    //if(rand() % 20 == 0 &&  user_redis_context_ != NULL)
+    /*if(user_redis_context_ != NULL)
+    {
+        redisFree(user_redis_context_);
+        user_redis_context_ = NULL;
+    }*/
+	if (user_redis_context_ == NULL ||(user_redis_context_ != NULL && user_redis_context_->err))
+	{
+      LOG(INFO) <<"user_redis reconnecting "<<"\n";
+      if(user_redis_context_ != NULL)
+      {
+        redisFree(user_redis_context_);
+      }
+      user_redis_context_ = NULL;
+			user_redis_context_ = redisConnectWithTimeout(user_host.c_str(), user_port, timeout);
+      if(user_pass.size() > 2)
+      {
+          redisReply *reply;
+          reply= (redisReply*)redisCommand(user_redis_context_, "AUTH %s", user_pass.c_str());
+          if (reply->type == REDIS_REPLY_ERROR)
+          {
+              LOG(INFO) << "Init user_redis_context_ failed" << "\n" ;
+              freeReplyObject(reply);
+              reply = NULL;
+              redisFree(user_redis_context_);
+              user_redis_context_ = NULL;
+              return ;
+          }
+      }
+	}
+	
+	  LOG(INFO) <<"begin redis read2"<<"\n";
+	  if (user_redis_context_ == NULL ||(user_redis_context_ != NULL && user_redis_context_->err))
+	  {
+	       LOG(INFO) <<"user_redis reconnect failed "<<"\n";
+	       redisFree(user_redis_context_);
+           user_redis_context_ = NULL;
+	     res["result"] = string("{\"result\":[]}");
+	     result.__set_results(res);
+	     cb(result);
+		 return;
+	  }
+	    LOG(INFO) <<"begin redis read3"<<"\n";
+	    if (news_redis_context_ == NULL || (news_redis_context_ != NULL && news_redis_context_->err))
+	    {
+	         LOG(INFO) <<"news_redis reconnecting "<<"\n";
+	         redisFree(news_redis_context_);
+			 news_redis_context_ = redisConnectWithTimeout(news_host.c_str(), news_port, timeout);
+	         if(news_pass.size() > 2)
+	         {
+	            redisReply *reply;
+	            reply= (redisReply*)redisCommand(news_redis_context_, "AUTH %s", news_pass.c_str());
+	            if (reply->type == REDIS_REPLY_ERROR)
+	            {
+	                LOG(INFO) << "Init user_redis_context_ failed" << "\n" ;
+	                freeReplyObject(reply);
+	                redisFree(news_redis_context_);
+	                return ;
+	            }
+	         }
+	    }
+	    LOG(INFO) <<"begin redis read4"<<"\n";
+	    if (news_redis_context_ == NULL || (news_redis_context_ != NULL && news_redis_context_->err))
+	    {
+	         LOG(INFO) <<"news_redis reconnect failed "<<"\n";
+	         redisFree(news_redis_context_);
+				 res["result"] = string("{\"result\":[]}");
+				 result.__set_results(res);
+				 cb(result);
+				 return;
+	    }
+	    LOG(INFO) <<"begin redis read5"<<"\n";
+		if(need_guid_mid == true && mid == "")
+	  {  
+			  if(guid_mid_redis_context_ == NULL || (guid_mid_redis_context_ != NULL && guid_mid_redis_context_->err))
+		    {
+		         LOG(INFO) <<"mid_guid_redis reconnecting "<<"\n";
+		         redisFree(guid_mid_redis_context_);
+						 guid_mid_redis_context_ = redisConnectWithTimeout(guid_mid_host.c_str(), guid_mid_port, timeout);
+		        if(guid_mid_pass.size() > 2)
+	          {
+	              redisReply *reply;
+	              reply= (redisReply*)redisCommand(guid_mid_redis_context_, "AUTH %s", guid_mid_pass.c_str());
+	              if (reply->type == REDIS_REPLY_ERROR)
+	              {
+	                  LOG(INFO) << "Init user_redis_context_ failed" << "\n" ;
+	                  freeReplyObject(reply);
+	                  redisFree(guid_mid_redis_context_);
+	                  return ;
+	              }
+	          }
+		    }
+	      if(guid_mid_redis_context_ == NULL || (guid_mid_redis_context_ != NULL && guid_mid_redis_context_->err))
+	      {
+	           LOG(INFO) <<"mid_guid_redis reconnect failed"<<"\n";
+	           redisFree(guid_mid_redis_context_);
+						 res["result"] = string("{\"result\":[]}");
+						 result.__set_results(res);
+						 cb(result);
+						 return;
+	      }
+		    string guid_key =  string("key_guid") + guid;
+		    redisReply* guid_mid_reply;
+		    guid_mid_reply = (redisReply*)redisCommand(user_redis_context_,"GET %s", guid_key.c_str()); 
+		    if(guid_mid_reply != NULL && guid_mid_reply->type == REDIS_REPLY_STRING)
+	    	{	
+	    		 mid = guid_mid_reply->str;
+	    	}
+	      freeReplyObject(guid_mid_reply);
+		}
+    //string enhanceDomain = iterAp->second;
+    
+    if(mid.size() < 1 && need_guid_mid == false && guid.size() > 1)
+    {
+	mid =  guid;
+    }    
+
+    string id_key= "id" + mid;
+
+
+    redisReply* user_word_reply;
+    LOG(INFO) <<"begin redis read6"<<"\n";
+    user_word_reply = (redisReply*)redisCommand(user_redis_context_,"GET %s", id_key.c_str()); 
+    LOG(INFO) <<"begin redis read7"<<"\n";
+    string word_str = "";
+    vector<K_V> word_kvs;
+    std::map<string, int> words_infor; 
+    if(user_word_reply != NULL && user_word_reply->type == REDIS_REPLY_STRING)
+    {
+        word_str =  user_word_reply->str;
+        std::vector<std::string> words = split(word_str,"\t");
+        std::vector<string>::iterator it;
+        for(it = words.begin(); it != words.end(); it++) 
+        {
+            std::vector<std::string> fs = split(*it,"|");
+            if(fs.size() != 2)
+            {
+                continue;
+            }
+            string word = fs[0];
+            int num = atoi(fs[1].c_str());
+            if(num < 2)
+            {
+                continue;
+            }
+            words_infor[word] = num;
+            K_V kv;
+            kv.k = word;
+            kv.v = (int)(1 + log(10 + num));
+            //LOG(INFO)<<word<<":"<<kv.v<<"\n";
+            word_kvs.push_back(kv);
+        }
+    }
+    else
+    {
+       /*freeReplyObject(user_word_reply);
+       res["result"] = string("{\"result\":[]}");
+       result.__set_results(res);
+       cb(result);
+       return;*/
+    }
+    freeReplyObject(user_word_reply);
+    LOG(INFO) <<"user:"<<mid<<" word:"<<word_str<<"\n";   
+    string idt_key = "idt" + mid;
+    LOG(INFO) <<"begin redis read8"<<"\n";
+    redisReply* user_tag_reply = (redisReply*)redisCommand(user_redis_context_, "GET %s", idt_key.c_str());
+    string tag_str = "7|2\t1|2\t2|2\t3|2\t4|2\t5|2";
+    if(user_tag_reply != NULL && user_tag_reply->type == REDIS_REPLY_STRING)
+    {
+         tag_str =  user_tag_reply->str;
+    }
+    freeReplyObject(user_tag_reply);
+    LOG(INFO) <<"user:"<<mid<<" tag:"<<tag_str<<"\n";
+    std::vector<std::string> tags = split(tag_str,"\t");
+    if(tags.size() < 2 * tag_num_tocall)
+    {
+        tag_str = tag_str + "\t" + "7|2\t1|2\t2|2\t3|2\t4|2\t5|2";
+        tags = split(tag_str,"\t");
+    }
+    
+    std::vector<string>::iterator it;
+    std::vector<std::map<string,Json::Value> >  news_infors; 
+    std::vector<unsigned int>  news_queue_weight; 
+    unsigned int news_queue_weight_sum; 
+    //unsigned int tag_used_num = 0;
+    //unsigned int news_used_num = 0;
+    //unsigned int tagNum = tags.size();
+    vector<K_V> tag_kvs;
+    for(it = tags.begin(); it != tags.end(); it++)
+    {
+        std::vector<std::string> fs = split(*it,"|");
+        if(fs.size() != 2)
+        {
+            continue;
+        }
+        string tag = fs[0];
+        int num = atoi(fs[1].c_str());
+        if(num < 2)
+        {
+            continue;
+        }
+        K_V kv;
+        kv.k = tag;
+        kv.v = (int)(1 + log(10 + num));
+        //LOG(INFO)<<tag<<":"<<kv.v<<"\n";
+        tag_kvs.push_back(kv);
+    }
+    vector<K_V> tag_sel = RandSel(tag_kvs, tag_num_tocall);
+    vector<K_V> word_sel;
+    if(word_kvs.size() >= 2 * word_num_tocall)
+    {
+        word_sel = RandSel(word_kvs, word_num_tocall);
+    }
+
+    //for(it = tags.begin(); it != tags.end(); it++)
+    std::vector<K_V>::iterator it_kv;
+    for(it_kv = tag_sel.begin(); it_kv != tag_sel.end(); it_kv++)
+    {
+        string tag = it_kv->k;
+        
+        std::map<string,string>::iterator it_map;
+
+        it_map = tagmap.find(tag);
+        if( it_map != tagmap.end())
+        {
+            tag = it_map->second;
+        }
+        std::map<string,Json::Value> news_infor;
+        string key = "tag" + tag;
+		LOG(INFO) <<"get news keys:"<< key <<"\n";
+        redisReply* get_reply = (redisReply*)redisCommand(news_redis_context_, "GET %s", key.c_str());
+		LOG(INFO) <<"get_reply==null: " << ((get_reply == NULL) ? "true\n":"false\n");
+        if(get_reply == NULL)
+        {
+            continue;
+        }
+		LOG(INFO) <<"get_reply->type: " << ((get_reply->type == REDIS_REPLY_STRING) ? "REDIS_REPLY_STRING" : "other");
+        if (get_reply != NULL && get_reply->type == REDIS_REPLY_STRING)
+        {
+            string v =  get_reply->str;
+            Json::Reader reader;
+            Json::Value root;
+            if (!reader.parse(v.c_str(), root, false))
+            {
+                 printf("parse json error");
+                 continue;
+            }
+            Json::Value array;
+            Json::Value add_value = root["result"];
+            for (unsigned int i = 0; i < add_value.size(); ++i)
+            {
+                Json::Value temp_value = add_value[i];
+                string title = temp_value["sql"].asString();
+                news_infor[title] = temp_value;
+            }
+        }
+        freeReplyObject(get_reply);
+        news_infors.push_back(news_infor);
+        news_queue_weight.push_back(it_kv->v);
+        news_queue_weight_sum += it_kv->v;
+        gettimeofday(&t_end, NULL);
+        cost_time = (t_end.tv_sec - t_start.tv_sec) + (t_end.tv_usec - t_start.tv_usec) / 1000000.0;
+        if(cost_time > 0.5)
+        {
+            break;
+        }
+    }
+    
+    for(it_kv = word_sel.begin(); it_kv != word_sel.end(); it_kv++)
+    {
+        string word = it_kv->k;
+        
+        std::map<string,Json::Value> news_infor;
+        string key = "qr" + word;
+		LOG(INFO) <<"get news keys:"<< key <<"\n";
+        redisReply* get_reply = (redisReply*)redisCommand(news_redis_context_, "GET %s", key.c_str());
+		LOG(INFO) <<"get_reply==null: " << ((get_reply == NULL) ? "true\n":"false\n");
+        if(get_reply == NULL)
+        {
+            continue;
+        }
+		LOG(INFO) <<"get_reply->type: " << ((get_reply->type == REDIS_REPLY_STRING) ? "REDIS_REPLY_STRING" : "other");
+        if (get_reply != NULL && get_reply->type == REDIS_REPLY_STRING)
+        {
+            string v =  get_reply->str;
+            Json::Reader reader;
+            Json::Value root;
+            if (!reader.parse(v.c_str(), root, false))
+            {
+                 printf("parse json error");
+                 continue;
+            }
+            Json::Value array;
+            Json::Value add_value = root["result"];
+            for (unsigned int i = 0; i < add_value.size(); ++i)
+            {
+                Json::Value temp_value = add_value[i];
+                string title = temp_value["sql"].asString();
+                news_infor[title] = temp_value;
+            }
+        }
+        freeReplyObject(get_reply);
+        news_infors.push_back(news_infor);
+        news_queue_weight.push_back(it_kv->v);
+        news_queue_weight_sum += it_kv->v;
+        gettimeofday(&t_end, NULL);
+        cost_time = (t_end.tv_sec - t_start.tv_sec) + (t_end.tv_usec - t_start.tv_usec) / 1000000.0;
+        if(cost_time > 0.5)
+        {
+            break;
+        }
+    }
+
+    gettimeofday(&t_end, NULL);
+    cost_time = (t_end.tv_sec - t_start.tv_sec) + (t_end.tv_usec - t_start.tv_usec) / 1000000.0;
+    LOG(INFO)<<"tag_used: "<<tag_num_tocall<<","<<"word_used:"<<word_num_tocall<<"time_used"<< cost_time <<endl;
+    
+    unsigned int queue_num = news_infors.size();
+    LOG(INFO)<<"queue_num: "<< queue_num;
+    NEWS_WEIGHT** heaps = new NEWS_WEIGHT*[queue_num];
+    for(unsigned int q =0; q < queue_num; q++)
+    {
+
+        heaps[q] = new NEWS_WEIGHT[max_res_num];
+        
+        std::map<string,Json::Value> news_infor = news_infors[q];
+        std::map<string,Json::Value>::iterator it_news_map;
+        //unsigned int reservered = 0;
+        //NEWS_WEIGHT heap[100];
+
+        for(unsigned int i =0; i < max_res_num; i++)
+        {
+            heaps[q][i].weight = 0.0;
+        }
+
+        for(it_news_map = news_infor.begin(); it_news_map != news_infor.end(); it_news_map++)
+        {
+            Json::Value &news_json = it_news_map->second;
+            string keyWords = news_json["kws"].asString();
+            string domain = news_json["domain"].asString();
+            float score = atof(strim(news_json["score"].asString()).c_str());
+            vector<string> vec = split_msp(keyWords," |");
+            std::vector<string>::iterator it_vec;
+            int kk = 1;
+            int k3 = 1;
+            for(it_vec = vec.begin(); it_vec != vec.end(); it_vec++)
+            {
+                if(words_infor.find(*it_vec) != words_infor.end())
+                {
+                    kk++;
+                }
+            }
+            if(domain == enhanceDomain)
+            {
+                k3 = 2;
+            }
+            if(kk >= 1)
+            {
+                NEWS_WEIGHT cur_news;
+                cur_news.news = news_json;
+                cur_news.weight = 0.0 + log(1.0 + kk) * k3 * score;
+                Adjust(heaps[q], max_res_num, cur_news); 
+            }
+        }
+        SortTop(heaps[q], max_res_num);
+    }
+    
+
+    std::map<string, int> news_toreturn;
+    unsigned int reservered = 0;
+    Json::Value res_json;
+    for(unsigned int i = 0; i < news_queue_weight.size(); i++)
+    {
+        news_queue_weight[i] = max_res_num * news_queue_weight[i] / news_queue_weight_sum;
+        news_queue_weight[i] = news_queue_weight[i] > 3 ? news_queue_weight[i] : 3 ;
+    }
+
+    for(unsigned int i = 0; i < max_res_num; i++)
+    {
+        
+        for(unsigned int q = 0; q < queue_num; q++)
+        {
+            string title =  heaps[q][i].news["title"].asString();
+            if(news_toreturn.end() != news_toreturn.find(title) || heaps[q][i].weight <= 0.0 ) 
+		{
+	    	    continue;
+	    	}
+            string keyWords = heaps[q][i].news["kws"].asString();
+            vector<string> vec = split_msp(keyWords," |");
+            string newkws = "";
+            for(unsigned int j = 0; j < kws_num_ret && j < vec.size(); j++)
+            {
+                if(newkws.size() < 1)
+                {
+                    newkws = vec[j];
+                }
+                else
+                {
+                    newkws = newkws + "|" + vec[j];
+                }
+            }
+            heaps[q][i].news["kws"] = newkws;
+            LOG(INFO) << "res" << i << heaps[q][i].news["title"] << ":" << heaps[q][i].news["url"]<<"\n";
+            res_json["result"].append(heaps[q][i].news);
+            reservered++;
+            news_toreturn[title] = 1;
+            if(reservered >= max_res_num)
+            {
+                break;
+            }
+        }
+        if(reservered >= max_res_num)
+        {
+            break;
+        }
+    }
+
+    for(unsigned int q =0; q < queue_num; q++)
+    {
+        delete []heaps[q];
+    }
+    delete []heaps;
+
+    if(reservered < 1)
+    {
+		res["result"] = string("{\"result\":[]}");
+		result.__set_results(res);
+		cb(result);
+		return;
+    }
+    //SortTop(heap, max_res_num);
+    Json::FastWriter fast_writer;
+    res["result"] = fast_writer.write(res_json);
+    
+    //res["result"] = "guofeng_test";
+    result.__set_results(res);
+    cb(result);
+}
+
+void Mod_NewsRecModule::HandleResponse(downstream::ErrCode ec,
+         boost::shared_ptr<downstream::http::GetResponse> response,
+        const InvokeCompleteHandler& complete_handler,
+        boost::shared_ptr<downstream::http::PostRequest> request) {
+    LOG(TRACE) << "HandleResponse";
+     cloud_ucs::InvokeResult result;
+     std::map<std::string, std::string> res;
+     string resultstr;
+
+     if (ec != downstream::OK || response->code() != 200) {
+		 LOG(DEBUG)<<"FILTER FAILED:"<<resultstr;
+        res["result"] = "";
+        result.__set_results(res);
+         complete_handler(result);
+        return ;
+     }
+     istringstream stream(response->body());
+     string line;
+     int i = 0;
+     while (getline(stream, line)) 
+     {
+         size_t pos = line.find("\t");
+        if (pos == string::npos) {
+             continue;
+         }
+         string query = line.substr(0, pos);
+         int type = atoi(line.substr(pos+1).c_str());
+         if (type == 0 or type == 100) {
+            if (i == 0)
+                 resultstr += query;
+             else
+                 resultstr += "\n" + query;
+             i++;
+         }
+     }
+ 
+     LOG(DEBUG)<<"AFTER FILTER:"<<resultstr;
+     res["result"] = resultstr;
+     result.__set_results(res);
+     complete_handler(result);
+ }
+
+void Mod_NewsRecModule::Status(const map<string, string>& params, const InvokeCompleteHandler& cb)
+{
+	LOG(TRACE) << "Mod_NewsRecModule::Status()";
+  	cloud_ucs::InvokeResult result; 
+        std::map<std::string, std::string> res;
+        res["result"] = string("ok");   
+        result.__set_results(res);    
+        cb(result);
+
+	/*
+	boost::shared_ptr<downstream::http::GetRequest> req_engine(
+			new downstream::http::GetRequest("/status"));
+	req_engine->AddHeader("Host", "baidu.com");
+	req_engine->Execute(sptr_baidu_server_.get(), cb,
+			std::tr1::bind(&Mod_NewsRecModule::HandleStatus, this,
+				_1, _2, _3,
+				req_engine));*/
+
+}
+
+void Mod_NewsRecModule::HandleStatus(downstream::ErrCode ec, 
+		boost::shared_ptr<downstream::http::GetResponse> response, 
+		const InvokeCompleteHandler& complete_handler, 
+		boost::shared_ptr<downstream::http::GetRequest> request)
+{
+	InvokeResult result;
+	map<string, string> my_res;
+	int code = 0;
+	if (ec == downstream::OK) 
+	{ 
+		code = response->code();
+		if (response->code() == 200)
+		{
+			my_res["result"] = response->body();
+            //my_res["result"] = "ok2";
+			goto Success;
+		}
+		else
+			goto Failed;
+	}
+	else
+	{
+		goto Failed;
+	}
+	LOG(DEBUG) << "Mod_NewsRecModule::HandleStats request use_count=" << request.use_count();
+
+Success:
+	LOG(DEBUG) << "HandleEngineStatus Success! " << ec << " " << code << " retry_cnt=" << response->retry_count();
+	result.__set_results(my_res);
+	complete_handler(result);
+	return;
+Failed:
+	LOG(DEBUG) << "HandleEngineStatus Failed! " << ec << " " << code << " check merger status failed!";
+	result.__set_ec(ErrorCode::E_INVOKE_FAILED);
+	result.__set_msg("check merger status failed!");
+	complete_handler(result);
+}
+void Mod_NewsRecModule::GetResult(const std::map<std::string, std::string>& params, const cloud_ucs::InvokeCompleteHandler& cb)
+{
+    LOG(TRACE) << "GetResult()";
+	std::map<std::string, std::string>::const_iterator iter = params.begin();
+	for (; iter != params.end(); ++iter)
+	{
+		LOG(DEBUG) << "Mod_NewsRecModule::GetResult params " << iter->first << "->" << iter->second;
+	}
+
+	iter = params.find("uri");
+	if (iter == params.end())
+	{
+		cloud_ucs::InvokeResult result;
+		result.__set_ec(1000);
+		result.__set_msg("");
+		return;
+	}
+
+	boost::shared_ptr<cloud_ucs::downstream::http::GetRequest> req(
+			new cloud_ucs::downstream::http::GetRequest(iter->second));
+ //       std::cerr << "uri = " << iter->second << "\n";
+
+	req->Execute(sptr_baidu_server_.get(), cb,
+			std::tr1::bind(&Mod_NewsRecModule::HandleGetResult, this,
+				std::tr1::placeholders::_1,
+				std::tr1::placeholders::_2,
+				std::tr1::placeholders::_3,
+				req));
+}
+
+void Mod_NewsRecModule::HandleGetResult(cloud_ucs::downstream::ErrCode ec, 
+		boost::shared_ptr<cloud_ucs::downstream::http::GetResponse> response,
+		const cloud_ucs::InvokeCompleteHandler& complete_handler,
+		boost::shared_ptr<cloud_ucs::downstream::http::GetRequest> request) 
+{
+    LOG(TRACE) << "HandleGetResult";
+	if (ec != cloud_ucs::downstream::OK) 
+	{
+		cloud_ucs::InvokeResult result;
+		result.__set_ec(ec);
+		result.__set_msg("GetResponse failed.");
+		complete_handler(result);
+		return;
+	}
+	// User logic:
+	// ...
+	// ...
+
+	std::map<std::string, std::string> my_res;
+	// Initialize the response to client:
+	// ...
+	// ...
+	my_res["Content-Type"] = "text/html";
+	my_res["result"] = std::string(response->body()); 
+
+	cloud_ucs::InvokeResult result;
+	result.__set_results(my_res);
+	complete_handler(result);
+	return;
+}
+
+EXPORT_MODULE(Mod_NewsRecModule)
